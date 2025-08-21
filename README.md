@@ -79,4 +79,4 @@ print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
 
 ## 📖 Reference
 
-* Vaswani et al., *Attention Is All You Need*, NeurIPS 2017 【7†Attention is All you Need.pdf】
+* Vaswani et al., *Attention Is All You Need*, NeurIPS 2017 【Attention is All you Need.pdf】
