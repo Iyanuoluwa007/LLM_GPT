@@ -3,16 +3,30 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 32
-block_size = 8
+batch_size = 64
+block_size = 256
 max_iters = 5000
 eval_interval = 500
-learning_rate = 1e-3
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 32
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
+# ------------
 
 
+import sys
+
+# open a log file
+log_file = open("output.txt", "w", encoding="utf-8")
+
+# helper function to print to both console and file
+def log_print(*args, **kwargs):
+    print(*args, **kwargs)  # print to console
+    print(*args, **kwargs, file=log_file)  # also write to file
+# replace the built-in print function with log_print
 
 torch.manual_seed(1337)
 
@@ -71,6 +85,8 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B,T,C = x.shape
         k = self.key(x) #(B, T, head_size)
@@ -81,6 +97,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5 # (B, T, head_size) @ (B, head_size, T) → (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
         # perform the weighted aggregation of the values
         out = wei @ v # (B, T, T) @ (B, T, head_size) → (B, T, head_size)
         return out
@@ -91,10 +108,14 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, head_size, num_heads):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return torch.cat([head(x) for head in self.heads], dim=-1)
-
+        out = torch.cat([h(x) for h in self.heads], dim=-1) # concatenate along the channel dimension
+        out = self.proj(out)
+        out = self.dropout(out) 
+        return out
 
 class FeedForward(nn.Module):
     """a simple linear layer followed by a non-linearity"""
@@ -102,13 +123,32 @@ class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd * 4),
+            nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
-            nn.Linear(n_embd * 4, n_embd)
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
         return self.net(x)
+
+class Block(nn.Module):
+    """Transformer block: communication followed by computation"""
+
+    def __init__(self, n_embd, n_head):
+        # n_embd: embedding dimension, n_head: the number of heads we'd like
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(head_size, n_head)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
 
 # Super simple bigram language model
 class BigramLanguageModel(nn.Module):
@@ -118,8 +158,8 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.sa_head = MultiHeadAttention(4, n_embd // 4)  # 4 heads of 8-dim self-attention
-        self.ffwd = FeedForward(n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -129,8 +169,7 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (Batch, Time, Channel) 
         pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device)) # (Time, Channel)
         x = tok_emb + pos_emb # (Batch, Time, Channel)
-        x = self.sa_head(x) # (Batch, Time, Channel)
-        x = self.ffwd(x) # (Batch, Time, Channel)
+        x = self.blocks(x) # (Batch, Time, Channel)
         logits = self.lm_head(x)  # (Batch, Time, Vocab_size)
 
         if targets is None:
@@ -169,7 +208,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 for iter in range(max_iters):
     if iter % eval_interval == 0:
         losses = estimate_loss()
-        print(f"Step {iter}: Train Loss: {losses['train']:.4f}, Val Loss: {losses['val']:.4f}")
+        log_print(f"Step {iter}: Train Loss: {losses['train']:.4f}, Val Loss: {losses['val']:.4f}")
 
     # sample a batch
     xb, yb = get_batch('train')
@@ -181,5 +220,10 @@ for iter in range(max_iters):
     optimizer.step()
 
 # Generate from the model
+# Generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+generated_text = decode(m.generate(context, max_new_tokens=500)[0].tolist())
+log_print(generated_text)
+
+# close the file
+log_file.close()
